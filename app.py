@@ -100,7 +100,15 @@ FEATURE_COLS = [
 def load_resources():
     # MediaPipe Face Mesh
     model_path = download_face_landmarker()
-    base_options = mp_tasks.BaseOptions(model_asset_path=model_path)
+    
+    st.write("STEP 1")
+    
+    base_options = mp_tasks.BaseOptions(
+        model_asset_path=model_path
+    )
+    
+    st.write("STEP 2")
+    
     options = mp_vision.FaceLandmarkerOptions(
         base_options=base_options,
         num_faces=1,
@@ -108,9 +116,16 @@ def load_resources():
         min_face_presence_confidence=0.3,
         min_tracking_confidence=0.3,
     )
+    
+    st.write("STEP 3")
+    
     face_mesh = mp_vision.FaceLandmarker.create_from_options(options)
-
+    
+    st.write("STEP 4")
+    
     ensemble = joblib.load(f"{MODEL_DIR}/best_model.pkl")
+    
+    st.write("STEP 5")
     scaler   = joblib.load(f"{MODEL_DIR}/scaler.pkl")
 
     kmeans_path = None
