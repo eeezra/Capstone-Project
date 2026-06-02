@@ -4,3 +4,6 @@ libxext6
 libxrender1
 libgomp1
 ffmpeg
+libgl1
+libgles2
+libegl1
