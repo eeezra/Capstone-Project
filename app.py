@@ -184,7 +184,7 @@ def make_cheek_ellipse_mask(img_shape, landmarks):
     h, w   = img_shape[:2]
     mid_y  = (landmarks[27][1] + landmarks[8][1]) // 2
     face_w = landmarks[16][0] - landmarks[0][0]
-    ew, eh = int(face_w * 0.22), int(face_w * 0.15)
+    ew, eh = int(face_w * 0.18), int(face_w * 0.13)
     mask   = np.zeros((h, w), dtype=np.uint8)
     cv2.ellipse(mask, (landmarks[1][0] + ew, mid_y),  (ew, eh), 0, 0, 360, 1, -1)
     cv2.ellipse(mask, (landmarks[15][0] - ew, mid_y), (ew, eh), 0, 0, 360, 1, -1)
@@ -213,8 +213,9 @@ def make_nose_mask(img_shape, landmarks):
 
 def filter_skin_pixels(lab_pixels):
     mask = (
-        (lab_pixels[:, 0] >= 20) & (lab_pixels[:, 0] <= 97) &
-        (lab_pixels[:, 1] >= 3)  & (lab_pixels[:, 1] <= 30)
+        (lab_pixels[:, 0] >= 25) & (lab_pixels[:, 0] <= 97) &
+        (lab_pixels[:, 1] >= 5)  & (lab_pixels[:, 1] <= 30) &
+        (lab_pixels[:, 2] >= 5)  & (lab_pixels[:, 2] <= 40)
     )
     return lab_pixels[mask]
 
