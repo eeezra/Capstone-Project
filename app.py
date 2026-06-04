@@ -343,66 +343,78 @@ def predict_mst_hybrid(feats, ensemble, scaler, kmeans, centroids, feature_cols,
 # REKOMENDASI
 # ─────────────────────────────────────────────
 def recommend_foundation(mst_pred, L, a, b, df_found, top_n=3):
+    """
+    Menghasilkan 3 kategori rekomendasi:
+    1. best_match : Top 3 shade dengan delta_e terkecil (warna paling dekat)
+    2. on_budget  : Top 3 produk termurah dari seluruh kandidat, lalu diurutkan lagi by delta_e
+    3. high_end   : Top 3 produk termahal dari seluruh kandidat, lalu diurutkan lagi by delta_e
+
+    Catatan:
+    - On Budget dan High End sengaja TIDAK dibatasi hanya mst_pred ± 1,
+      supaya produk murah seperti Wardah/OMG tetap bisa muncul.
+    - Nilai delta_e tetap dihitung dan ditampilkan sebagai match score.
+    """
     df = df_found.copy()
-    df['delta_e'] = np.sqrt(
-        (df['lab_L'] - L)**2 +
-        (df['lab_a'] - a)**2 +
-        (df['lab_b'] - b)**2
+
+    # Pastikan kolom numerik aman dipakai untuk sorting harga.
+    if "price_numeric" in df.columns:
+        df["price_num"] = pd.to_numeric(df["price_numeric"], errors="coerce")
+    else:
+        df["price_num"] = pd.to_numeric(df.get("Price", 0), errors="coerce")
+
+    df["price_num"] = df["price_num"].fillna(0)
+
+    # Hitung jarak warna antara kulit user dan shade foundation dalam ruang LAB.
+    df["delta_e"] = np.sqrt(
+        (df["lab_L"] - L) ** 2 +
+        (df["lab_a"] - a) ** 2 +
+        (df["lab_b"] - b) ** 2
     )
 
-    mst_range  = [mst_pred - 1, mst_pred, mst_pred + 1]
-    df_primary = df[df['mst_id'].isin(mst_range)].sort_values('delta_e')
-    df_fallback= df[~df['mst_id'].isin(mst_range)].sort_values('delta_e')
-    df_scored  = pd.concat([df_primary, df_fallback]).reset_index(drop=True)
+    # Prioritas best match tetap warna paling dekat, dengan preferensi MST sekitar prediksi user.
+    mst_range = [int(mst_pred) - 1, int(mst_pred), int(mst_pred) + 1]
+    df_primary = df[df["mst_id"].isin(mst_range)].sort_values(["delta_e", "price_num"], ascending=[True, True])
+    df_fallback = df[~df["mst_id"].isin(mst_range)].sort_values(["delta_e", "price_num"], ascending=[True, True])
+    df_match_pool = pd.concat([df_primary, df_fallback], ignore_index=True)
 
-    def pick_top(pool, n=3):
+    def unique_products(pool, n=3):
+        """Ambil n item unik berdasarkan Brand + Product + Shade."""
         pool = pool.copy().reset_index(drop=True)
-        # Bucket delta_e per 2 unit
-        pool['bucket'] = (pool['delta_e'] // 2).astype(int)
-
-        # Shuffle dalam bucket — tanpa groupby.apply agar kompatibel pandas baru
-        shuffled_parts = []
-        for _, grp in pool.groupby('bucket', sort=True):
-            shuffled_parts.append(grp.sample(frac=1, random_state=None))
-        pool = pd.concat(shuffled_parts).reset_index(drop=True)
-
-        picks, used_brands = [], set()
+        picks = []
+        used = set()
         for _, row in pool.iterrows():
-            brand = str(row.get('Brand', '')).strip().lower()
-            if brand not in used_brands:
-                picks.append(row)
-                used_brands.add(brand)
-            if len(picks) == n:
+            key = (
+                str(row.get("Brand", "")).strip().lower(),
+                str(row.get("Product", "")).strip().lower(),
+                str(row.get("Shade", "")).strip().lower(),
+            )
+            if key in used:
+                continue
+            picks.append(row)
+            used.add(key)
+            if len(picks) >= n:
                 break
-
-        # Fallback jika brand unik < n
-        if len(picks) < n:
-            for _, row in pool.iterrows():
-                if len(picks) == n:
-                    break
-                if not any(
-                    p.get('Product') == row.get('Product') and
-                    p.get('Shade')   == row.get('Shade')
-                    for p in picks
-                ):
-                    picks.append(row)
         return pd.DataFrame(picks).reset_index(drop=True)
 
-    # ── Best Match: delta_e terkecil tanpa filter harga ──
-    best_match = pick_top(df_scored, n=top_n)
-
-    # ── On Budget: 3 termurah dari pool relevan ──
-    on_budget = pick_top(
-        df_scored.sort_values('Price'), n=top_n
+    best_match = unique_products(
+        df_match_pool.sort_values(["delta_e", "price_num"], ascending=[True, True]),
+        top_n
     )
 
-    # ── High End: 3 termahal dari pool relevan ──
-    high_end = pick_top(
-        df_scored.sort_values('Price', ascending=False), n=top_n
+    # Termurah dari seluruh dataset, bukan dari best_match pool saja.
+    # Ini memastikan Wardah/OMG tetap muncul saat memang paling murah.
+    on_budget = unique_products(
+        df.sort_values(["price_num", "delta_e"], ascending=[True, True]),
+        top_n
+    )
+
+    # Termahal dari seluruh dataset, lalu jika harga sama pilih yang warna paling dekat.
+    high_end = unique_products(
+        df.sort_values(["price_num", "delta_e"], ascending=[False, True]),
+        top_n
     )
 
     return best_match, on_budget, high_end
-
 
 # ─────────────────────────────────────────────
 # HELPER: CIELAB → HEX
@@ -1653,54 +1665,149 @@ def slug(text):
     return re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_")
 
 
-def product_image_path(brand, shade=None):
-    """Cari gambar produk secara robust.
-    - folder brand dicari case-insensitive, jadi brand "Mop" tetap bisa masuk ke folder "MOP"
-    - nama shade dicari case-insensitive
-    - support jpg/png/jpeg/webp/avif
+def _norm_file_key(text):
+    """Normalisasi nama file/shade agar pencarian gambar lebih toleran."""
+    text = str(text).lower().strip()
+    text = text.replace("_", " ").replace("-", " ")
+    text = re.sub(r"\.(jpg|jpeg|png|webp|avif)$", "", text)
+    text = re.sub(r"[^a-z0-9#]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _find_child_dir_case_insensitive(parent, target_name):
+    if not parent.exists() or not target_name:
+        return None
+    target_key = _norm_file_key(target_name)
+    for child in parent.iterdir():
+        if child.is_dir() and _norm_file_key(child.name) == target_key:
+            return child
+    return None
+
+
+def _find_image_in_dir(folder, names):
+    """Cari file gambar di folder berdasarkan beberapa kandidat nama."""
+    if folder is None or not folder.exists():
+        return None
+
+    allowed_ext = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
+    clean_names = [str(n).strip() for n in names if n is not None and str(n).strip() and str(n).strip().lower() not in ["nan", "none", "-"]]
+    name_keys = [_norm_file_key(n) for n in clean_names]
+
+    files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in allowed_ext]
+
+    # 1) exact normalized stem
+    for file in files:
+        stem_key = _norm_file_key(file.stem)
+        if stem_key in name_keys:
+            return str(file)
+
+    # 2) contains matching, berguna untuk nama shade yang tidak 100% sama
+    for file in files:
+        stem_key = _norm_file_key(file.stem)
+        for key in name_keys:
+            if key and (key in stem_key or stem_key in key):
+                return str(file)
+
+    return None
+
+
+def product_image_path(brand, shade=None, product=None, image_hint=None):
+    """
+    Cari gambar produk secara robust.
+
+    Struktur folder yang didukung:
+    - assets/products/<Brand>/<Shade>.webp
+    - assets/products/<Product>/<Shade>.webp
+    - assets/products/<Brand Product>/<Shade>.webp
+    - recursive fallback dari basename kolom Image di foundation_mst.csv
+
+    Cocok untuk struktur GitHub kamu:
+    Capstone-Project/assets/products/(folder merk/produk)/(file .webp/.png/.jpg)
     """
     try:
-        brand_str = str(brand).strip()
+        brand_str = str(brand).strip() if brand is not None else ""
         shade_str = str(shade).strip() if shade is not None else ""
+        product_str = str(product).strip() if product is not None else ""
+        image_hint_str = str(image_hint).strip() if image_hint is not None else ""
 
-        # 1) cari folder brand exact dulu, lalu case-insensitive
-        brand_dir = PRODUCT_DIR / brand_str
-        if not brand_dir.exists():
-            brand_dir = None
-            if PRODUCT_DIR.exists():
-                for child in PRODUCT_DIR.iterdir():
-                    if child.is_dir() and child.name.lower() == brand_str.lower():
-                        brand_dir = child
-                        break
+        allowed_ext = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
 
-        # 2) cari file berdasarkan shade di dalam folder brand
-        if brand_dir and brand_dir.exists() and shade_str:
-            allowed_ext = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
+        # Ambil basename dari kolom Image, termasuk path Windows seperti D:\\...\\Shade.jpg
+        image_basename = ""
+        if image_hint_str and image_hint_str.lower() not in ["nan", "none", "-"]:
+            image_basename = image_hint_str.replace("\\", "/").split("/")[-1]
 
-            # exact candidate
-            for ext in allowed_ext:
-                candidate = brand_dir / f"{shade_str}{ext}"
-                if candidate.exists():
-                    return str(candidate)
+        filename_candidates = [
+            image_basename,
+            shade_str,
+            f"{shade_str}.jpg",
+            f"{shade_str}.jpeg",
+            f"{shade_str}.png",
+            f"{shade_str}.webp",
+            f"{shade_str}.avif",
+        ]
 
-            # case-insensitive exact stem
-            shade_key = shade_str.lower().strip()
-            for file in brand_dir.iterdir():
-                if file.is_file() and file.suffix.lower() in allowed_ext:
-                    if file.stem.lower().strip() == shade_key:
-                        return str(file)
+        # Kandidat folder paling mungkin.
+        folder_candidates = []
+        raw_folder_names = []
+        if brand_str:
+            raw_folder_names.append(brand_str)
+        if product_str:
+            raw_folder_names.append(product_str)
+            raw_folder_names.append(f"{brand_str} {product_str}".strip())
+        if image_hint_str and image_hint_str.lower() not in ["nan", "none", "-"]:
+            parts = image_hint_str.replace("\\", "/").split("/")
+            if len(parts) >= 2:
+                raw_folder_names.append(parts[-2])
 
-            # fallback contains matching: berguna kalau shade di CSV "C10 Pearl" dan file ada variasi nama
-            for file in brand_dir.iterdir():
-                if file.is_file() and file.suffix.lower() in allowed_ext:
-                    stem = file.stem.lower().strip()
-                    if shade_key in stem or stem in shade_key:
-                        return str(file)
+        seen_dirs = set()
+        for name in raw_folder_names:
+            if not name:
+                continue
+            direct = PRODUCT_DIR / name
+            ci = _find_child_dir_case_insensitive(PRODUCT_DIR, name)
+            for d in [direct if direct.exists() else None, ci]:
+                if d is not None and str(d) not in seen_dirs:
+                    folder_candidates.append(d)
+                    seen_dirs.add(str(d))
 
-        # 3) fallback per brand png di root products
+        # Tambahan: folder yang mengandung nama brand/product.
         if PRODUCT_DIR.exists():
+            brand_key = _norm_file_key(brand_str)
+            product_key = _norm_file_key(product_str)
+            for child in PRODUCT_DIR.iterdir():
+                if not child.is_dir() or str(child) in seen_dirs:
+                    continue
+                child_key = _norm_file_key(child.name)
+                if (
+                    (brand_key and brand_key in child_key) or
+                    (product_key and product_key in child_key) or
+                    (product_key and child_key in product_key)
+                ):
+                    folder_candidates.append(child)
+                    seen_dirs.add(str(child))
+
+        # Cari pada folder kandidat.
+        for folder in folder_candidates:
+            found = _find_image_in_dir(folder, filename_candidates)
+            if found:
+                return found
+
+        # Recursive fallback: cocokkan basename Image atau Shade di seluruh assets/products.
+        if PRODUCT_DIR.exists():
+            keys = [_norm_file_key(x) for x in filename_candidates if x]
+            for file in PRODUCT_DIR.rglob("*"):
+                if not file.is_file() or file.suffix.lower() not in allowed_ext:
+                    continue
+                file_key = _norm_file_key(file.name)
+                stem_key = _norm_file_key(file.stem)
+                for key in keys:
+                    if key and (key == file_key or key == stem_key or key in stem_key or stem_key in key):
+                        return str(file)
+
+            # Brand root fallback, misalnya assets/products/fenty_beauty.png
             for file in PRODUCT_DIR.iterdir():
-                if file.is_file() and file.stem.lower() == slug(brand_str).lower():
+                if file.is_file() and file.suffix.lower() in allowed_ext and _norm_file_key(file.stem) == _norm_file_key(brand_str):
                     return str(file)
 
     except Exception:
@@ -1711,18 +1818,28 @@ def product_image_path(brand, shade=None):
             return str(dummy)
     return None
 
+
 def encode_image_for_html(img_path):
     try:
+        if not img_path:
+            return ""
         p = Path(img_path)
         if not p.exists():
             return ""
         ext = p.suffix.lower().replace('.', '')
-        if ext == 'jpg':
-            ext = 'jpeg'
+        mime_map = {
+            'jpg': 'jpeg',
+            'jpeg': 'jpeg',
+            'png': 'png',
+            'webp': 'webp',
+            'avif': 'avif',
+        }
+        ext = mime_map.get(ext, ext)
         data = base64.b64encode(p.read_bytes()).decode('utf-8')
         return f"data:image/{ext};base64,{data}"
     except Exception:
         return ""
+
 
 def ehtml(value):
     return html.escape(str(value)) if value is not None else "-"
@@ -1959,7 +2076,7 @@ def recommendations_page():
     if str(display_skintone).lower() == "medium":
         display_skintone = "Medium Beige"
     user_undertone = result.get("user_undertone", "-")
-    
+
     best_match = pd.DataFrame(result.get("best_match", []))
     on_budget  = pd.DataFrame(result.get("on_budget",  []))
     high_end   = pd.DataFrame(result.get("high_end",   []))
@@ -1972,7 +2089,7 @@ def recommendations_page():
     st.markdown('<h1 class="page-title">Foundation Recommendations</h1>', unsafe_allow_html=True)
     st.markdown(
         '<div class="subtitle" style="margin:0 0 1.1rem;max-width:760px;">'
-        'Matched to your skin tone — Best Match · On Budget · High End'
+        'Matched to your skin tone — Best Match · On Budget · High-End'
         '</div>',
         unsafe_allow_html=True
     )
@@ -1987,69 +2104,96 @@ def recommendations_page():
         unsafe_allow_html=True
     )
 
-    # ── Helper render kartu ──
-    def render_cards(df_section, cols):
-        for idx, (_, row) in enumerate(df_section.iterrows()):
-            brand   = str(row.get("Brand",   "-"))
-            product = str(row.get("Product", "-"))
-            shade   = str(row.get("Shade",   "-"))
-            price   = format_rupiah(row.get("Price", "-"))
+    def render_recommendation_section(title, subtitle, df_section, pill_style=""):
+        if df_section.empty:
+            return
+
+        st.markdown(
+            f'<div style="margin:1.6rem 0 .7rem;">'
+            f'<span class="pill" {pill_style}>{title}</span>'
+            f'&nbsp;<span class="small-text">{subtitle}</span></div>',
+            unsafe_allow_html=True
+        )
+        cols = st.columns(3, gap="large")
+
+        for idx, (_, row) in enumerate(df_section.head(3).iterrows()):
+            brand     = str(row.get("Brand",   "-"))
+            product   = str(row.get("Product", "-"))
+            shade     = str(row.get("Shade",   "-"))
+            undertone = str(row.get("Undertone", "-"))
+            skintone  = str(row.get("Skin tone", row.get("skintone_norm", "-")))
+            price     = format_rupiah(row.get("Price", row.get("price_num", "-")))
             hex_color = cielab_to_hex(
                 row.get("lab_L", 65),
                 row.get("lab_a", 10),
                 row.get("lab_b", 20)
             )
             sim = float(safe_similarity(row.get("delta_e", 6)))
-            html_card = (
-                f'<div class="html-product-card">'
-                f'<div class="html-product-top">'
-                f'<div><div class="swatch" style="width:48px;height:48px;background:{hex_color};border-radius:.6rem;"></div></div>'
-                f'<div style="flex:1;">'
-                f'<div class="html-brand">{ehtml(brand)}</div>'
-                f'<div class="html-name">{ehtml(product)} — {ehtml(shade)}</div>'
-                f'<div style="font-weight:900;font-size:1rem;margin-top:.35rem;">{ehtml(price)}</div>'
-                f'</div>'
-                f'<div class="match-badge">▲ {sim:.1f}%</div>'
-                f'</div>'
-                f'<div style="display:flex;justify-content:space-between;margin-top:.65rem;">'
-                f'<span class="small-text">Match Score</span><strong>{sim:.1f}%</strong></div>'
-                f'<div class="html-bar"><div style="width:{sim:.1f}%;"></div></div>'
-                f'</div>'
+
+            img_path = product_image_path(
+                brand=brand,
+                shade=shade,
+                product=product,
+                image_hint=row.get("Image", None),
             )
+            img_src = encode_image_for_html(img_path) if img_path else ""
+            img_tag = (
+                f"<img class='html-product-img' src='{img_src}' alt='{ehtml(brand)} {ehtml(shade)}'/>"
+                if img_src else
+                "<div class='html-product-img' style='display:flex;align-items:center;justify-content:center;color:#7B6472;font-size:.75rem;'>No image</div>"
+            )
+
+            html_card = f"""
+            <div class="html-product-card">
+                <div class="html-product-top">
+                    <div>{img_tag}</div>
+                    <div>
+                        <div class="html-brand">{ehtml(brand)}</div>
+                        <div class="html-name">{ehtml(product)}<br><span style="font-weight:800;color:#7B6472;">{ehtml(shade)}</span></div>
+                        <div style="display:flex;align-items:center;gap:.55rem;margin-top:.55rem;">
+                            <div class="swatch" style="width:34px;height:28px;background:{hex_color};"></div>
+                            <span class="small-text">{hex_color}</span>
+                        </div>
+                        <div style="margin-top:.65rem;">
+                            <span class="chip">{ehtml(undertone)}</span>
+                            <span class="chip">{ehtml(skintone)}</span>
+                        </div>
+                    </div>
+                    <div class="html-price">
+                        <div>{ehtml(price)}</div>
+                        <div style="margin-top:.6rem;" class="match-badge">▲ {sim:.1f}% match</div>
+                    </div>
+                </div>
+                <div style="display:flex;justify-content:space-between;margin-top:.8rem;">
+                    <span class="small-text">Match Score</span><strong>{sim:.1f}%</strong>
+                </div>
+                <div class="html-bar"><div style="width:{sim:.1f}%;"></div></div>
+            </div>
+            """
             with cols[idx % 3]:
                 st.markdown(html_card, unsafe_allow_html=True)
 
-    # ── SECTION 1: Best Match ──
-    st.markdown(
-        '<div style="margin:1.4rem 0 .6rem;">'
-        '<span class="pill" style="background:rgba(255,168,214,.55);color:#D94E91;">⭐ Best Match</span>'
-        '&nbsp;<span class="small-text">Closest color to your skin tone</span></div>',
-        unsafe_allow_html=True
+    render_recommendation_section(
+        "⭐ Top 3 Best Match",
+        "Closest shade color to your detected skin tone",
+        best_match,
+        'style="background:rgba(255,168,214,.55);color:#D94E91;"'
     )
-    cols_bm = st.columns(3, gap="large")
-    render_cards(best_match, cols_bm)
 
-    # ── SECTION 2: On Budget ──
-    st.markdown(
-        '<div style="margin:1.6rem 0 .6rem;">'
-        '<span class="pill green">💚 On Budget</span>'
-        '&nbsp;<span class="small-text">Best value picks</span></div>',
-        unsafe_allow_html=True
+    render_recommendation_section(
+        "💚 Top 3 On Budget",
+        "Lowest price options available in your dataset",
+        on_budget,
+        'style="background:rgba(212,235,194,.7);color:#758952;border-color:rgba(181,196,154,.55);"'
     )
-    cols_ob = st.columns(3, gap="large")
-    render_cards(on_budget, cols_ob)
 
-    # ── SECTION 3: High End ──
-    st.markdown(
-        '<div style="margin:1.6rem 0 .6rem;">'
-        '<span class="pill" style="background:rgba(244,226,255,.7);color:#9B59B6;">💎 High End</span>'
-        '&nbsp;<span class="small-text">Premium picks</span></div>',
-        unsafe_allow_html=True
+    render_recommendation_section(
+        "💎 Top 3 High-End",
+        "Highest price / premium options available in your dataset",
+        high_end,
+        'style="background:rgba(244,226,255,.7);color:#9B59B6;"'
     )
-    cols_he = st.columns(3, gap="large")
-    render_cards(high_end, cols_he)
 
-    # ── Download report ──
     st.markdown('<div style="height:1.2rem;"></div>', unsafe_allow_html=True)
     report_img = create_analysis_report(result, dark_mode=True)
     buffer = BytesIO()
