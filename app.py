@@ -342,17 +342,65 @@ def predict_mst_hybrid(feats, ensemble, scaler, kmeans, centroids, feature_cols,
 # ─────────────────────────────────────────────
 # REKOMENDASI
 # ─────────────────────────────────────────────
-def recommend_foundation(mst_pred, L, a, b, df_found, top_n=6):
+def recommend_foundation(mst_pred, L, a, b, df_found, top_n=3):
     df = df_found.copy()
     df['delta_e'] = np.sqrt(
         (df['lab_L'] - L)**2 +
         (df['lab_a'] - a)**2 +
         (df['lab_b'] - b)**2
     )
+
     mst_range  = [mst_pred - 1, mst_pred, mst_pred + 1]
     df_primary = df[df['mst_id'].isin(mst_range)].sort_values('delta_e')
     df_fallback= df[~df['mst_id'].isin(mst_range)].sort_values('delta_e')
-    return pd.concat([df_primary, df_fallback]).head(top_n).reset_index(drop=True)
+    df_scored  = pd.concat([df_primary, df_fallback]).reset_index(drop=True)
+
+    def pick_top(pool, n=3):
+        """Ambil top-n dari pool, brand unik diprioritaskan, shuffle bucket skor sama."""
+        pool = pool.copy()
+        # Bucket delta_e per 2 unit, shuffle dalam bucket
+        pool['bucket'] = (pool['delta_e'] // 2).astype(int)
+        pool = (
+            pool.groupby('bucket', group_keys=False)
+                .apply(lambda x: x.sample(frac=1, random_state=None))
+                .reset_index(drop=True)
+        )
+        pool = pool.sort_values('bucket').reset_index(drop=True)
+        picks, used_brands = [], set()
+        for _, row in pool.iterrows():
+            brand = str(row.get('Brand', '')).strip().lower()
+            if brand not in used_brands:
+                picks.append(row)
+                used_brands.add(brand)
+            if len(picks) == n:
+                break
+        # Fallback jika brand unik < n
+        if len(picks) < n:
+            for _, row in pool.iterrows():
+                if len(picks) == n:
+                    break
+                if not any(
+                    p.get('Product') == row.get('Product') and
+                    p.get('Shade')   == row.get('Shade')
+                    for p in picks
+                ):
+                    picks.append(row)
+        return pd.DataFrame(picks).reset_index(drop=True)
+
+    # ── Best Match: delta_e terkecil tanpa filter harga ──
+    best_match = pick_top(df_scored, n=top_n)
+
+    # ── On Budget: 3 termurah dari pool relevan ──
+    on_budget = pick_top(
+        df_scored.sort_values('Price'), n=top_n
+    )
+
+    # ── High End: 3 termahal dari pool relevan ──
+    high_end = pick_top(
+        df_scored.sort_values('Price', ascending=False), n=top_n
+    )
+
+    return best_match, on_budget, high_end
 
 
 # ─────────────────────────────────────────────
@@ -1893,51 +1941,119 @@ def recommendations_page():
             st.session_state["page"] = "Skin Analysis"
             st.rerun()
         return
-    recs = pd.DataFrame(result.get("top5_recs", []))
-    if recs.empty:
-        st.warning("Tidak ada rekomendasi foundation yang tersedia.")
-        return
-    skin_hex = result.get("skin_hex", "#C4956A")
-    mst_pred = result.get("mst_pred", "-")
+
+    skin_hex         = result.get("skin_hex", "#C4956A")
+    mst_pred         = result.get("mst_pred", 5)
     display_skintone = result.get("user_skintone", "-")
-    if str(display_skintone).lower() == "medium": display_skintone = "Medium Beige"
+    if str(display_skintone).lower() == "medium":
+        display_skintone = "Medium Beige"
+    user_undertone = result.get("user_undertone", "-")
+    L = result.get("global_L", 60)
+    a = result.get("global_a", 10)
+    b = result.get("global_b", 15)
+
+    resources = get_resources_or_stop()
+    df_found  = resources["df_found"]
+
+    best_match, on_budget, high_end = recommend_foundation(
+        mst_pred, L, a, b, df_found, top_n=3
+    )
+
     st.markdown('<div class="pill">Step 3 of 3</div>', unsafe_allow_html=True)
     st.markdown('<h1 class="page-title">Foundation Recommendations</h1>', unsafe_allow_html=True)
-    st.markdown('<div class="subtitle" style="margin:0 0 1.1rem;max-width:760px;">Showing shades matched to your skin tone • Sorted by similarity</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="custom-card" style="padding:1.2rem;display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:1rem;"><div style="display:flex;align-items:center;gap:1rem;"><div class="swatch" style="background:{skin_hex};width:64px;height:64px;"></div><div><div class="small-text">Your detected skin color</div><div style="font-weight:900;font-size:1.15rem;">{display_skintone} · {result.get("user_undertone","-")} Undertone · MST-{mst_pred}</div><div class="small-text">{skin_hex}</div></div></div></div>', unsafe_allow_html=True)
-    st.markdown('<div class="filters-header-box"><strong style="font-size:1.05rem;">Filters</strong></div>', unsafe_allow_html=True)
-    st.markdown('<div class="filters-shell">', unsafe_allow_html=True)
-    brand_options = ["All"] + sorted(recs["Brand"].dropna().astype(str).unique().tolist())
-    st.markdown('<div class="filter-group"><div class="filter-group-title">Brand</div></div>', unsafe_allow_html=True)
-    brand_filter = st.radio("Brand", brand_options, horizontal=True, key="rec_brand_filter", label_visibility="collapsed")
-    undertone_options = ["All"] + sorted(recs["Undertone"].dropna().astype(str).unique().tolist()) if "Undertone" in recs else ["All"]
-    st.markdown('<div class="filter-group"><div class="filter-group-title">Undertone</div></div>', unsafe_allow_html=True)
-    undertone_filter = st.radio("Undertone", undertone_options, horizontal=True, key="rec_undertone_filter", label_visibility="collapsed")
-    st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown('<div style="height:1rem;"></div>', unsafe_allow_html=True)
-    filtered = recs.copy()
-    if brand_filter != "All": filtered = filtered[filtered["Brand"].astype(str).eq(brand_filter)]
-    if undertone_filter != "All" and "Undertone" in filtered: filtered = filtered[filtered["Undertone"].astype(str).eq(undertone_filter)]
-    if "delta_e" not in filtered: filtered["delta_e"] = 6
-    filtered["similarity"] = filtered["delta_e"].apply(safe_similarity)
-    cols = st.columns(2, gap="large")
-    for idx, (_, row) in enumerate(filtered.head(6).iterrows()):
-        brand, product, shade = str(row.get("Brand","-")), str(row.get("Product","-")), str(row.get("Shade","-"))
-        undertone = str(row.get("Undertone","-")); skintone = str(row.get("Skin tone", row.get("skintone_norm", "-")))
-        price = format_rupiah(row.get("Price", "-"))
-        hex_color = cielab_to_hex(row.get("lab_L",65), row.get("lab_a",10), row.get("lab_b",20))
-        sim = float(row.get("similarity",88))
-        img_path = product_image_path(brand, shade)
-        img_src = encode_image_for_html(img_path) if img_path else ""
-        ml = "25 ml" if brand.lower() == "omg" else "30 ml"
-        img_tag = ("<img class='html-product-img' src='" + img_src + "'/>" if img_src else "<div class='html-product-img'></div>")
-        html_card = f"""<div class="html-product-card"><div class="html-product-top"><div>{img_tag}</div><div><div class="html-brand">{ehtml(brand)}</div><div class="html-name">{ehtml(product)} - {ehtml(shade)}</div><div style="display:flex;align-items:center;gap:.55rem;"><div class="swatch" style="width:34px;height:28px;background:{hex_color};"></div><span class="small-text">{hex_color}</span></div><div style="margin-top:.6rem;"><span class="chip">{ehtml(undertone)}</span> <span class="chip">{ehtml(skintone)}</span></div></div><div class="html-price"><div>{ehtml(price)}</div><div class="small-text">{ml}</div><div style="margin-top:.6rem;" class="match-badge">▲ {sim:.1f}% match</div></div></div><div style="display:flex;justify-content:space-between;"><span class="small-text">Match Score</span><strong>{sim:.1f}%</strong></div><div class="html-bar"><div style="width:{sim:.1f}%;"></div></div></div>"""
-        with cols[idx % 2]: st.markdown(html_card, unsafe_allow_html=True)
-    report_img = create_analysis_report(result, dark_mode=True)
-    buffer = BytesIO(); report_img.save(buffer, format="PNG"); buffer.seek(0)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    st.download_button(label="📥 Download Hasil Analisis", data=buffer, file_name=f"hasil_analisis_foundation_{timestamp}.png", mime="image/png", use_container_width=True)
+    st.markdown(
+        '<div class="subtitle" style="margin:0 0 1.1rem;max-width:760px;">'
+        'Matched to your skin tone — Best Match · On Budget · High End'
+        '</div>',
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        f'<div class="custom-card" style="padding:1.2rem;display:flex;align-items:center;'
+        f'gap:1rem;margin-bottom:1.4rem;">'
+        f'<div class="swatch" style="background:{skin_hex};width:64px;height:64px;"></div>'
+        f'<div><div class="small-text">Your detected skin color</div>'
+        f'<div style="font-weight:900;font-size:1.15rem;">'
+        f'{display_skintone} · {user_undertone} Undertone · MST-{mst_pred}</div>'
+        f'<div class="small-text">{skin_hex}</div></div></div>',
+        unsafe_allow_html=True
+    )
 
+    # ── Helper render kartu ──
+    def render_cards(df_section, cols):
+        for idx, (_, row) in enumerate(df_section.iterrows()):
+            brand   = str(row.get("Brand",   "-"))
+            product = str(row.get("Product", "-"))
+            shade   = str(row.get("Shade",   "-"))
+            price   = format_rupiah(row.get("Price", "-"))
+            hex_color = cielab_to_hex(
+                row.get("lab_L", 65),
+                row.get("lab_a", 10),
+                row.get("lab_b", 20)
+            )
+            sim = float(safe_similarity(row.get("delta_e", 6)))
+            html_card = (
+                f'<div class="html-product-card">'
+                f'<div class="html-product-top">'
+                f'<div><div class="swatch" style="width:48px;height:48px;background:{hex_color};border-radius:.6rem;"></div></div>'
+                f'<div style="flex:1;">'
+                f'<div class="html-brand">{ehtml(brand)}</div>'
+                f'<div class="html-name">{ehtml(product)} — {ehtml(shade)}</div>'
+                f'<div style="font-weight:900;font-size:1rem;margin-top:.35rem;">{ehtml(price)}</div>'
+                f'</div>'
+                f'<div class="match-badge">▲ {sim:.1f}%</div>'
+                f'</div>'
+                f'<div style="display:flex;justify-content:space-between;margin-top:.65rem;">'
+                f'<span class="small-text">Match Score</span><strong>{sim:.1f}%</strong></div>'
+                f'<div class="html-bar"><div style="width:{sim:.1f}%;"></div></div>'
+                f'</div>'
+            )
+            with cols[idx % 3]:
+                st.markdown(html_card, unsafe_allow_html=True)
+
+    # ── SECTION 1: Best Match ──
+    st.markdown(
+        '<div style="margin:1.4rem 0 .6rem;">'
+        '<span class="pill" style="background:rgba(255,168,214,.55);color:#D94E91;">⭐ Best Match</span>'
+        '&nbsp;<span class="small-text">Closest color to your skin tone</span></div>',
+        unsafe_allow_html=True
+    )
+    cols_bm = st.columns(3, gap="large")
+    render_cards(best_match, cols_bm)
+
+    # ── SECTION 2: On Budget ──
+    st.markdown(
+        '<div style="margin:1.6rem 0 .6rem;">'
+        '<span class="pill green">💚 On Budget</span>'
+        '&nbsp;<span class="small-text">Best value picks</span></div>',
+        unsafe_allow_html=True
+    )
+    cols_ob = st.columns(3, gap="large")
+    render_cards(on_budget, cols_ob)
+
+    # ── SECTION 3: High End ──
+    st.markdown(
+        '<div style="margin:1.6rem 0 .6rem;">'
+        '<span class="pill" style="background:rgba(244,226,255,.7);color:#9B59B6;">💎 High End</span>'
+        '&nbsp;<span class="small-text">Premium picks</span></div>',
+        unsafe_allow_html=True
+    )
+    cols_he = st.columns(3, gap="large")
+    render_cards(high_end, cols_he)
+
+    # ── Download report ──
+    st.markdown('<div style="height:1.2rem;"></div>', unsafe_allow_html=True)
+    report_img = create_analysis_report(result, dark_mode=True)
+    buffer = BytesIO()
+    report_img.save(buffer, format="PNG")
+    buffer.seek(0)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    st.download_button(
+        label="📥 Download Hasil Analisis",
+        data=buffer,
+        file_name=f"hasil_analisis_foundation_{timestamp}.png",
+        mime="image/png",
+        use_container_width=True
+    )
 
 
 def about_method_page():
