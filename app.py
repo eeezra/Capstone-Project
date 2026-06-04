@@ -356,16 +356,16 @@ def recommend_foundation(mst_pred, L, a, b, df_found, top_n=3):
     df_scored  = pd.concat([df_primary, df_fallback]).reset_index(drop=True)
 
     def pick_top(pool, n=3):
-        """Ambil top-n dari pool, brand unik diprioritaskan, shuffle bucket skor sama."""
-        pool = pool.copy()
-        # Bucket delta_e per 2 unit, shuffle dalam bucket
+        pool = pool.copy().reset_index(drop=True)
+        # Bucket delta_e per 2 unit
         pool['bucket'] = (pool['delta_e'] // 2).astype(int)
-        pool = (
-            pool.groupby('bucket', group_keys=False)
-                .apply(lambda x: x.sample(frac=1, random_state=None))
-                .reset_index(drop=True)
-        )
-        pool = pool.sort_values('bucket').reset_index(drop=True)
+
+        # Shuffle dalam bucket — tanpa groupby.apply agar kompatibel pandas baru
+        shuffled_parts = []
+        for _, grp in pool.groupby('bucket', sort=True):
+            shuffled_parts.append(grp.sample(frac=1, random_state=None))
+        pool = pd.concat(shuffled_parts).reset_index(drop=True)
+
         picks, used_brands = [], set()
         for _, row in pool.iterrows():
             brand = str(row.get('Brand', '')).strip().lower()
@@ -374,6 +374,7 @@ def recommend_foundation(mst_pred, L, a, b, df_found, top_n=3):
                 used_brands.add(brand)
             if len(picks) == n:
                 break
+
         # Fallback jika brand unik < n
         if len(picks) < n:
             for _, row in pool.iterrows():
