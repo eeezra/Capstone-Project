@@ -526,11 +526,17 @@ def run_pipeline(img_rgb, face_mesh, ensemble, scaler,
     top3_hex = [{"mst": t["mst"], "conf": t["conf"],
                  "hex": mst_hex_lookup.get(t["mst"], "#888888")} for t in top3]
 
-    recs    = recommend_foundation(
+    best_match, on_budget, high_end = recommend_foundation(
         mst, feats["global_L_mean"], feats["global_a_mean"], feats["global_b_mean"],
-        df_found, top_n=5
+        df_found, top_n=3
     )
-    top_rec = recs.iloc[0]
+    # top_rec tetap diambil dari best_match untuk info ringkas di Results page
+    top_rec = best_match.iloc[0] if not best_match.empty else pd.Series({
+        "Shade": "-", "Brand": "-", "Product": "-",
+        "lab_L": 65, "lab_a": 10, "lab_b": 20,
+        "Undertone": "-", "Price": 0
+    })
+                     
     latency = round((time.time() - t0) * 1000, 1)
 
     vis = img_rgb.copy()
@@ -566,7 +572,14 @@ def run_pipeline(img_rgb, face_mesh, ensemble, scaler,
     "user_skintone" : user_skintone,
     "undertone" : top_rec["Undertone"],
     "price"     : format_rupiah(top_rec["Price"]),
-    "top5_recs" : recs.to_dict(orient="records"),
+    "best_match" : best_match.to_dict(orient="records"),
+    "on_budget"  : on_budget.to_dict(orient="records"),
+    "high_end"   : high_end.to_dict(orient="records"),
+    # backward compat — Results page pakai top5_recs untuk summary card
+    "top5_recs"  : best_match.to_dict(orient="records"),
+    "global_L"   : round(feats["global_L_mean"], 2),
+    "global_a"   : round(feats["global_a_mean"], 2),
+    "global_b"   : round(feats["global_b_mean"], 2),
     "cielab"    : {
         "L": round(feats["global_L_mean"], 2),
         "a": round(feats["global_a_mean"], 2),
@@ -1949,16 +1962,14 @@ def recommendations_page():
     if str(display_skintone).lower() == "medium":
         display_skintone = "Medium Beige"
     user_undertone = result.get("user_undertone", "-")
-    L = result.get("global_L", 60)
-    a = result.get("global_a", 10)
-    b = result.get("global_b", 15)
+    
+    best_match = pd.DataFrame(result.get("best_match", []))
+    on_budget  = pd.DataFrame(result.get("on_budget",  []))
+    high_end   = pd.DataFrame(result.get("high_end",   []))
 
-    resources = get_resources_or_stop()
-    df_found  = resources["df_found"]
-
-    best_match, on_budget, high_end = recommend_foundation(
-        mst_pred, L, a, b, df_found, top_n=3
-    )
+    if best_match.empty and on_budget.empty and high_end.empty:
+        st.warning("Tidak ada rekomendasi foundation yang tersedia.")
+        return
 
     st.markdown('<div class="pill">Step 3 of 3</div>', unsafe_allow_html=True)
     st.markdown('<h1 class="page-title">Foundation Recommendations</h1>', unsafe_allow_html=True)
