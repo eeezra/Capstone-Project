@@ -344,25 +344,41 @@ def predict_mst_hybrid(feats, ensemble, scaler, kmeans, centroids, feature_cols,
 # ─────────────────────────────────────────────
 def recommend_foundation(mst_pred, L, a, b, df_found, top_n=3):
     """
-    Menghasilkan 3 kategori rekomendasi:
-    1. best_match : Top 3 shade dengan delta_e terkecil (warna paling dekat)
-    2. on_budget  : Top 3 produk termurah dari seluruh kandidat, lalu diurutkan lagi by delta_e
-    3. high_end   : Top 3 produk termahal dari seluruh kandidat, lalu diurutkan lagi by delta_e
+    Menghasilkan 3 kategori rekomendasi foundation:
+    1. Best Match : shade paling dekat berdasarkan delta_e, dengan brand berbeda.
+    2. On Budget  : harga termurah, diurutkan dari yang paling murah, dengan brand berbeda.
+    3. High End   : harga tertinggi/premium, dengan brand berbeda.
 
-    Catatan:
-    - On Budget dan High End sengaja TIDAK dibatasi hanya mst_pred ± 1,
-      supaya produk murah seperti Wardah/OMG tetap bisa muncul.
-    - Nilai delta_e tetap dihitung dan ditampilkan sebagai match score.
+    Catatan penting:
+    - Brand dalam satu kategori dipastikan tidak duplikat.
+    - Contoh brand seperti L'Oreal/Maybelline/Make Over hanya contoh, bukan urutan yang dikunci.
+    - Pemilihan tetap mengikuti data dan hasil analisis warna pengguna.
     """
     df = df_found.copy()
 
-    # Pastikan kolom numerik aman dipakai untuk sorting harga.
+    # Pastikan harga numerik aman dipakai untuk sorting.
     if "price_numeric" in df.columns:
         df["price_num"] = pd.to_numeric(df["price_numeric"], errors="coerce")
     else:
-        df["price_num"] = pd.to_numeric(df.get("Price", 0), errors="coerce")
+        raw_price = df["Price"] if "Price" in df.columns else 0
+        if hasattr(raw_price, "astype"):
+            raw_price = raw_price.astype(str).str.replace(r"[^0-9]", "", regex=True)
+        df["price_num"] = pd.to_numeric(raw_price, errors="coerce")
 
     df["price_num"] = df["price_num"].fillna(0)
+
+    # Normalisasi brand hanya untuk mengecek duplikasi brand.
+    if "Brand" in df.columns:
+        df["brand_key"] = (
+            df["Brand"].astype(str)
+            .str.strip()
+            .str.lower()
+            .str.replace("’", "'", regex=False)
+            .str.replace("`", "'", regex=False)
+            .str.replace(r"\s+", " ", regex=True)
+        )
+    else:
+        df["brand_key"] = ""
 
     # Hitung jarak warna antara kulit user dan shade foundation dalam ruang LAB.
     df["delta_e"] = np.sqrt(
@@ -371,48 +387,71 @@ def recommend_foundation(mst_pred, L, a, b, df_found, top_n=3):
         (df["lab_b"] - b) ** 2
     )
 
-    # Prioritas best match tetap warna paling dekat, dengan preferensi MST sekitar prediksi user.
+    # Best match tetap memprioritaskan MST prediksi dan MST sekitar.
     mst_range = [int(mst_pred) - 1, int(mst_pred), int(mst_pred) + 1]
-    df_primary = df[df["mst_id"].isin(mst_range)].sort_values(["delta_e", "price_num"], ascending=[True, True])
-    df_fallback = df[~df["mst_id"].isin(mst_range)].sort_values(["delta_e", "price_num"], ascending=[True, True])
-    df_match_pool = pd.concat([df_primary, df_fallback], ignore_index=True)
+    df["mst_priority"] = np.where(df["mst_id"].isin(mst_range), 0, 1)
 
-    def unique_products(pool, n=3):
-        """Ambil n item unik berdasarkan Brand + Product + Shade."""
-        pool = pool.copy().reset_index(drop=True)
+    def pick_distinct_brands(pool, n=3):
+        """Ambil n produk dari brand yang berbeda sesuai urutan pool."""
         picks = []
-        used = set()
+        used_brands = set()
+
         for _, row in pool.iterrows():
-            key = (
-                str(row.get("Brand", "")).strip().lower(),
-                str(row.get("Product", "")).strip().lower(),
-                str(row.get("Shade", "")).strip().lower(),
-            )
-            if key in used:
+            brand_key = str(row.get("brand_key", "")).strip().lower()
+            if not brand_key or brand_key in used_brands:
                 continue
             picks.append(row)
-            used.add(key)
+            used_brands.add(brand_key)
             if len(picks) >= n:
                 break
+
+        # Fallback kalau dataset brand-nya sangat terbatas: tetap isi sampai n, tapi hindari produk duplikat.
+        if len(picks) < n:
+            used_products = {
+                (
+                    str(r.get("Brand", "")).strip().lower(),
+                    str(r.get("Product", "")).strip().lower(),
+                    str(r.get("Shade", "")).strip().lower(),
+                )
+                for r in picks
+            }
+            for _, row in pool.iterrows():
+                product_key = (
+                    str(row.get("Brand", "")).strip().lower(),
+                    str(row.get("Product", "")).strip().lower(),
+                    str(row.get("Shade", "")).strip().lower(),
+                )
+                if product_key in used_products:
+                    continue
+                picks.append(row)
+                used_products.add(product_key)
+                if len(picks) >= n:
+                    break
+
         return pd.DataFrame(picks).reset_index(drop=True)
 
-    best_match = unique_products(
-        df_match_pool.sort_values(["delta_e", "price_num"], ascending=[True, True]),
-        top_n
+    best_pool = df.sort_values(
+        ["mst_priority", "delta_e", "price_num"],
+        ascending=[True, True, True]
     )
 
-    # Termurah dari seluruh dataset, bukan dari best_match pool saja.
-    # Ini memastikan Wardah/OMG tetap muncul saat memang paling murah.
-    on_budget = unique_products(
-        df.sort_values(["price_num", "delta_e"], ascending=[True, True]),
-        top_n
+    # On Budget: harga paling murah dulu, lalu kecocokan warna. Output tetap diurutkan termurah.
+    budget_pool = df.sort_values(
+        ["price_num", "mst_priority", "delta_e"],
+        ascending=[True, True, True]
     )
 
-    # Termahal dari seluruh dataset, lalu jika harga sama pilih yang warna paling dekat.
-    high_end = unique_products(
-        df.sort_values(["price_num", "delta_e"], ascending=[False, True]),
-        top_n
+    # High End: harga tertinggi dulu, lalu kecocokan warna.
+    high_pool = df.sort_values(
+        ["price_num", "mst_priority", "delta_e"],
+        ascending=[False, True, True]
     )
+
+    best_match = pick_distinct_brands(best_pool, top_n)
+    on_budget = pick_distinct_brands(budget_pool, top_n).sort_values(
+        ["price_num", "delta_e"], ascending=[True, True]
+    ).reset_index(drop=True)
+    high_end = pick_distinct_brands(high_pool, top_n)
 
     return best_match, on_budget, high_end
 
@@ -898,12 +937,6 @@ def create_analysis_report(result, dark_mode=True):
     a_val = lab.get("a", "-")
     b_val = lab.get("b", "-")
 
-    brand = result.get("brand", "-")
-    product = result.get("product", "-")
-    shade = result.get("shade_name", result.get("shade", "-"))
-    rec_undertone = result.get("undertone", "-")
-    price = _format_price(result.get("price", "-"))
-    top5 = result.get("top5_recs", [])
     alt_mst = _get_alt_mst(result, confidence)
     report_img = _extract_report_image(result)
 
@@ -955,6 +988,12 @@ def create_analysis_report(result, dark_mode=True):
         product_muted = "#8A7682"
         footer_muted = "#A18897"
 
+    rec_categories = [
+        ("Best Match", "Closest shade color to your detected skin tone", result.get("best_match", []), pink),
+        ("On Budget", "Sorted from the lowest price", result.get("on_budget", []), green),
+        ("High End", "Premium/high-end options", result.get("high_end", []), "#9B59B6"),
+    ]
+
     font_title = _load_font(42, bold=True)
     font_sub = _load_font(20)
     font_h2 = _load_font(28, bold=True)
@@ -994,7 +1033,9 @@ def create_analysis_report(result, dark_mode=True):
 
     ry2 = ry1 + 540
     by = max(left_y2, ry2) + 40
-    bottom_y2 = by + 620
+    # Download report now follows the app output: 3 vertical recommendation categories.
+    category_h = 330
+    bottom_y2 = by + 84 + (category_h * 3) + 28
     H = bottom_y2 + 90
 
     img = Image.new("RGB", (W, H), bg)
@@ -1102,82 +1143,85 @@ def create_analysis_report(result, dark_mode=True):
         except Exception:
             return None
 
-    left_bottom = (margin, by, 760, bottom_y2)
-    right_bottom = (800, by, W - margin, bottom_y2)
-    _draw_card(draw, left_bottom, fill=card_fill, outline=border, radius=26)
-    _draw_card(draw, right_bottom, fill=card_fill, outline=border, radius=26)
+    rec_x1, rec_y1, rec_x2, rec_y2 = margin, by, W - margin, bottom_y2
+    _draw_card(draw, (rec_x1, rec_y1, rec_x2, rec_y2), fill=card_fill, outline=border, radius=26)
+    draw.text((rec_x1 + 28, rec_y1 + 24), "Foundation Recommendations", font=font_h2, fill=text_dark)
+    draw.text((rec_x1 + 28, rec_y1 + 62), "Best Match • On Budget • High End", font=font_small, fill=text_muted)
+    draw.line((rec_x1 + 28, rec_y1 + 92, rec_x2 - 28, rec_y1 + 92), fill=line, width=2)
 
-    # Main recommendation with larger text and product image on the right
-    lx1, ly1, lx2, ly2 = left_bottom
-    draw.text((lx1 + 28, ly1 + 24), "Main Recommendation", font=font_h2, fill=text_dark)
-    draw.line((lx1 + 28, ly1 + 72, lx2 - 28, ly1 + 72), fill=line, width=2)
+    def _rec_value(rec, *keys, default="-"):
+        for key in keys:
+            if isinstance(rec, dict) and key in rec and rec.get(key) not in [None, ""]:
+                return rec.get(key)
+        return default
 
-    image_box_w, image_box_h = 190, 240
-    image_box_x1 = lx2 - 28 - image_box_w
-    image_box_y1 = ly1 + 120
-    image_box_x2 = image_box_x1 + image_box_w
-    image_box_y2 = image_box_y1 + image_box_h
-    draw.rounded_rectangle((image_box_x1, image_box_y1, image_box_x2, image_box_y2), radius=18, fill=row_fill, outline=soft_outline, width=1)
-
-    main_thumb = _load_product_thumb(brand, shade, image_box_w - 22, image_box_h - 22)
-    if main_thumb is not None:
-        img.paste(main_thumb, (image_box_x1 + 11, image_box_y1 + 11), main_thumb)
-    else:
-        draw.text((image_box_x1 + 34, image_box_y1 + image_box_h // 2 - 10), "No image", font=font_small, fill=text_muted)
-
-    info_x, info_y = lx1 + 28, ly1 + 104
-    value_x = info_x + 150
-    value_w = image_box_x1 - value_x - 20
-    main_items = [("Brand", brand), ("Product", product), ("Shade", shade), ("Undertone", rec_undertone), ("Price", price)]
-    for label, value in main_items:
-        draw.text((info_x, info_y), str(label), font=font_rec_label, fill=text_muted)
-        info_y = _draw_text_block(draw, value_x, info_y, value, font_rec_value, text_dark, value_w, line_gap=8, max_lines=2)
-        info_y += 24
-
-    # Top 5 recommendations with index, product image, text, and swatch
-    rx1b, ry1b, rx2b, ry2b = right_bottom
-    draw.text((rx1b + 28, ry1b + 24), "Top 5 Recommendations", font=font_h2, fill=text_dark)
-    draw.line((rx1b + 28, ry1b + 72, rx2b - 28, ry1b + 72), fill=line, width=2)
-    row_x1, row_x2 = rx1b + 28, rx2b - 28
-    row_y, row_h, row_gap = ry1b + 92, 88, 10
-    for idx, rec in enumerate(top5[:5], start=1):
-        brand_i = str(rec.get("Brand", "-"))
-        product_i = str(rec.get("Product", "-"))
-        shade_i = str(rec.get("Shade", rec.get("shade_name", "-")))
-        undertone_i = str(rec.get("Undertone", "-"))
-        price_i = _format_price(rec.get("Price", "-"))
+    def _draw_recommendation_row(rec, idx, x1, y1, x2, y2, accent):
+        brand_i = str(_rec_value(rec, "Brand"))
+        product_i = str(_rec_value(rec, "Product"))
+        shade_i = str(_rec_value(rec, "Shade", "shade_name"))
+        undertone_i = str(_rec_value(rec, "Undertone"))
+        skintone_i = str(_rec_value(rec, "Skin tone", "skintone_norm", "SkinTone", default="-"))
+        price_i = _format_price(_rec_value(rec, "Price", "price_num"))
         swatch_hex = _safe_hex_from_rec(rec)
-        y1 = row_y + (idx - 1) * (row_h + row_gap)
-        y2 = y1 + row_h
-        draw.rounded_rectangle((row_x1, y1, row_x2, y2), radius=16, fill=row_fill, outline=soft_outline, width=1)
 
-        badge_size = 32
-        badge_x1, badge_y1 = row_x1 + 12, y1 + (row_h - badge_size) // 2
-        draw.rounded_rectangle((badge_x1, badge_y1, badge_x1 + badge_size, badge_y1 + badge_size), radius=10, fill=badge_fill, outline=soft_outline, width=1)
+        draw.rounded_rectangle((x1, y1, x2, y2), radius=16, fill=row_fill, outline=soft_outline, width=1)
+
+        badge_size = 34
+        badge_x1, badge_y1 = x1 + 14, y1 + (y2 - y1 - badge_size) // 2
+        draw.rounded_rectangle((badge_x1, badge_y1, badge_x1 + badge_size, badge_y1 + badge_size), radius=11, fill=badge_fill, outline=soft_outline, width=1)
         num = str(idx)
         nb = draw.textbbox((0, 0), num, font=font_small)
-        draw.text((badge_x1 + (badge_size - (nb[2] - nb[0])) // 2, badge_y1 + (badge_size - (nb[3] - nb[1])) // 2 - 1), num, font=font_small, fill="#D94E91")
+        draw.text((badge_x1 + (badge_size - (nb[2] - nb[0])) // 2, badge_y1 + (badge_size - (nb[3] - nb[1])) // 2 - 1), num, font=font_small, fill=accent)
 
-        thumb_size = 52
-        thumb_x1 = badge_x1 + badge_size + 12
-        thumb_y1 = y1 + (row_h - thumb_size) // 2
-        draw.rounded_rectangle((thumb_x1, thumb_y1, thumb_x1 + thumb_size, thumb_y1 + thumb_size), radius=12, fill=frame_fill, outline=soft_outline, width=1)
+        thumb_size = 62
+        thumb_x1 = badge_x1 + badge_size + 14
+        thumb_y1 = y1 + (y2 - y1 - thumb_size) // 2
+        draw.rounded_rectangle((thumb_x1, thumb_y1, thumb_x1 + thumb_size, thumb_y1 + thumb_size), radius=13, fill=frame_fill, outline=soft_outline, width=1)
         thumb = _load_product_thumb(brand_i, shade_i, thumb_size - 8, thumb_size - 8)
         if thumb is not None:
             img.paste(thumb, (thumb_x1 + 4, thumb_y1 + 4), thumb)
+        else:
+            draw.text((thumb_x1 + 9, thumb_y1 + 23), "No img", font=font_tiny, fill=text_muted)
 
-        sw_size = 38
-        sw_x1, sw_y1 = row_x2 - 52, y1 + (row_h - sw_size) // 2
-        draw.rounded_rectangle((sw_x1, sw_y1, sw_x1 + sw_size, sw_y1 + sw_size), radius=12, fill=swatch_hex, outline=soft_outline, width=1)
+        sw_size = 44
+        sw_x1, sw_y1 = x2 - 64, y1 + (y2 - y1 - sw_size) // 2
+        draw.rounded_rectangle((sw_x1, sw_y1, sw_x1 + sw_size, sw_y1 + sw_size), radius=13, fill=swatch_hex, outline=soft_outline, width=1)
 
-        text_x = thumb_x1 + thumb_size + 14
-        text_max_w = sw_x1 - 16 - text_x
+        price_w = 190
+        price_x = sw_x1 - price_w - 22
+        pb = draw.textbbox((0, 0), price_i, font=font_top5_title)
+        draw.text((price_x + price_w - (pb[2] - pb[0]), y1 + 18), price_i, font=font_top5_title, fill=text_dark)
+        # Keterangan match score dan HEX tidak ditampilkan di report download
+        # agar layout lebih bersih sesuai tampilan rekomendasi produk.
+
+        text_x = thumb_x1 + thumb_size + 18
+        text_max_w = price_x - 18 - text_x
         title = _fit_text(draw, f"{brand_i} • {shade_i}", font_top5_title, text_max_w)
         product_line = _fit_text(draw, product_i, font_top5_meta, text_max_w)
-        meta = _fit_text(draw, f"{undertone_i} • {price_i}", font_top5_meta, text_max_w)
         draw.text((text_x, y1 + 10), title, font=font_top5_title, fill=text_dark)
-        draw.text((text_x, y1 + 35), product_line, font=font_top5_meta, fill=product_muted)
-        draw.text((text_x, y1 + 57), meta, font=font_top5_meta, fill=text_muted)
+        draw.text((text_x, y1 + 36), product_line, font=font_top5_meta, fill=product_muted)
+
+        # Chip undertone & skintone tidak ditampilkan pada report download.
+
+    cat_x1, cat_x2 = rec_x1 + 28, rec_x2 - 28
+    cat_y = rec_y1 + 116
+    cat_h = 316
+    for cidx, (cat_title, cat_subtitle, recs, accent) in enumerate(rec_categories):
+        y1 = cat_y + cidx * (cat_h + 14)
+        y2 = y1 + cat_h
+        draw.rounded_rectangle((cat_x1, y1, cat_x2, y2), radius=20, fill=mst_fill, outline=soft_outline, width=2)
+        draw.text((cat_x1 + 24, y1 + 16), cat_title, font=font_rec_label, fill=text_dark)
+        draw.text((cat_x1 + 24, y1 + 43), cat_subtitle, font=font_small, fill=text_muted)
+
+        recs = recs or []
+        row_y = y1 + 76
+        row_h = 72
+        row_gap = 10
+        if not recs:
+            draw.text((cat_x1 + 24, row_y + 16), "No recommendation available.", font=font_small, fill=text_muted)
+        for idx, rec in enumerate(recs[:3], start=1):
+            ry = row_y + (idx - 1) * (row_h + row_gap)
+            _draw_recommendation_row(rec, idx, cat_x1 + 20, ry, cat_x2 - 20, ry + row_h, accent)
 
     draw.text((margin + 4, H - 42), "Generated by ShadeMate", font=font_small, fill=footer_muted)
     draw.text((W - 320, H - 42), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), font=font_small, fill=footer_muted)
@@ -1200,7 +1244,7 @@ MST_COLORS = {
 }
 
 BRANDS = [
-    "Wardah", "Luxcrime", "Omg", "Mop", "Jacquelle", "Dazzle Me",
+    "Wardah", "Luxcrime", "OMG", "MOP", "Jacquelle", "Dazzle Me",
     "Make Over", "Maybelline", "Fenty Beauty", "L'Oreal Paris"
 ]
 
@@ -1239,9 +1283,10 @@ def inject_ui_hotfix_css():
 
 
     .analysis-preview-img img { border-radius:1rem !important; border:1px solid rgba(255,168,214,.35); box-shadow:0 12px 24px rgba(0,0,0,.08); }
-    .html-product-card{ background:rgba(255,255,255,.80); border:1px solid rgba(255,168,214,.45); border-radius:1.15rem; padding:1rem; min-height:235px; box-shadow:0 16px 30px rgba(200,107,133,.08); margin-bottom:1rem; }
-    .html-product-top{ display:grid; grid-template-columns:92px 1fr 120px; gap:1rem; align-items:start; }
-    .html-product-img{ width:82px; height:104px; object-fit:contain; border-radius:.8rem; background:#FFF0F5; border:1px solid rgba(232,192,197,.45); }
+    .html-product-card{ background:rgba(255,255,255,.80); border:1px solid rgba(255,168,214,.45); border-radius:1.15rem; padding:1rem; min-height:235px; box-shadow:0 16px 30px rgba(200,107,133,.08); margin-bottom:1rem; width:100%; max-width:100%; box-sizing:border-box; overflow:hidden; }
+    .html-product-top{ display:grid; grid-template-columns:84px minmax(0,1fr) auto; gap:1rem; align-items:start; }
+    .html-product-top > div{ min-width:0; }
+    .html-product-img{ width:82px; height:104px; max-width:100%; object-fit:contain; border-radius:.8rem; background:#FFF0F5; border:1px solid rgba(232,192,197,.45); }
     .html-brand{ font-size:.78rem; color:#7B6472; letter-spacing:.08em; text-transform:uppercase; font-weight:900; margin-bottom:.2rem; }
     .html-name{ font-weight:900; color:#2F2330; font-size:1rem; margin-bottom:.45rem; }
     .html-price{ text-align:right; font-weight:900; color:#2F2330; font-size:1.02rem; }
@@ -1297,22 +1342,23 @@ def inject_ui_hotfix_css():
 
     /* Processing Pipeline horizontal seperti mockup */
     .pipeline-card{ padding:1.4rem 1.6rem 1.8rem !important; overflow:hidden !important; margin-bottom:1.55rem !important; }
-    .method-timeline{ display:grid !important; grid-template-columns:repeat(6,minmax(110px,1fr)) !important; gap:2.4rem !important; align-items:start !important; text-align:center !important; margin-top:.85rem !important; }
-    .method-step{ position:relative !important; min-height:145px !important; }
-    .method-step:not(:last-child)::after{ content:'⟶'; position:absolute; right:-2.05rem; top:48px; color:#F48ABD; font-weight:900; opacity:.92; font-size:2rem; line-height:1; }
+    .method-timeline{ display:grid !important; grid-template-columns:repeat(6,minmax(0,1fr)) !important; gap:1.6rem !important; align-items:stretch !important; text-align:center !important; margin-top:.85rem !important; }
+    .method-step{ position:relative !important; min-height:145px !important; min-width:0 !important; }
+    .method-step:not(:last-child)::after{ content:'⟶'; position:absolute; right:-1.25rem; top:48px; color:#F48ABD; font-weight:900; opacity:.92; font-size:1.5rem; line-height:1; }
     .method-step .step-badge{ width:22px !important; height:22px !important; border-radius:999px !important; display:flex !important; align-items:center !important; justify-content:center !important; color:white !important; font-size:.78rem !important; font-weight:900 !important; margin:0 auto .45rem !important; }
     .method-step .method-icon{ width:58px !important; height:58px !important; border-radius:1rem !important; display:flex !important; align-items:center !important; justify-content:center !important; font-size:1.75rem !important; margin:.25rem auto .55rem !important; border:1px solid currentColor !important; }
     .method-step .method-title{ font-weight:900 !important; margin-top:.35rem !important; line-height:1.25 !important; }
     .method-cards-row{ margin-top:.3rem !important; }
 
     /* Technology stack diperkecil */
-    .tech-stack-box{ padding:1rem 1.15rem !important; margin-top:1rem !important; }
-    .tech-stack-box h3{ font-size:1.7rem !important; margin-bottom:.5rem !important; }
+    .tech-stack-box{ padding:0.5rem 1.15rem !important; margin-top:1rem !important; }
+    .tech-stack-box h3{ font-size:1.5rem !important; margin-bottom:0.1rem !important; }
     .tech-card.compact{ padding:.75rem .85rem !important; border-radius:1rem !important; min-height:unset !important; }
     .tech-card.compact strong{ font-size:.92rem !important; }
     .tech-card.compact .small-text{ font-size:.72rem !important; line-height:1.4 !important; }
     .tech-icon.compact{ width:36px !important; height:36px !important; font-size:1rem !important; }
 
+    @media(max-width:1280px){ .method-timeline{ grid-template-columns:repeat(3,minmax(0,1fr)) !important; gap:1.2rem 1.4rem !important; } .method-step:nth-child(3n)::after{ display:none !important; } }
     @media(max-width:900px){ .method-timeline{ grid-template-columns:repeat(2,1fr) !important; } .method-step::after{ display:none !important; } }
 
 
@@ -1424,6 +1470,13 @@ def inject_ui_hotfix_css():
     .match-badge{
         color:var(--sm-text) !important;
         border-color:var(--sm-border) !important;
+    }
+    .html-product-card .chip{
+        display:inline-flex !important;
+        align-items:center !important;
+        justify-content:center !important;
+        white-space:nowrap !important;
+        margin:0 !important;
     }
 
     .swatch{
@@ -1653,6 +1706,99 @@ def inject_ui_hotfix_css():
         .ref-box,
         .notice{
             background:rgba(45,34,43,.94) !important;
+        }
+    }
+
+    /* =========================================================
+       EQUAL-SIZE CARDS + ZOOM / SPLIT-SCREEN SAFETY
+       - Kartu rekomendasi & step dibuat ukuran sama
+       - Konten tidak keluar dari kotak saat zoom/perkecil/split
+       ========================================================= */
+
+    /* Konten panjang (nama produk/harga) tetap di dalam kotak */
+    .html-product-card,
+    .method-card,
+    .feature-card,
+    .step-node,
+    .tech-card.compact{
+        box-sizing:border-box !important;
+        max-width:100% !important;
+        overflow:hidden !important;
+        overflow-wrap:anywhere !important;
+        word-break:break-word !important;
+    }
+    .html-name, .html-brand, .html-price{ overflow-wrap:anywhere !important; }
+    .html-price{ white-space:normal !important; }
+
+    /* Tinggi seragam per jenis kartu → semua kotak terlihat sama ukuran */
+    .html-product-card{ min-height:260px !important; height:100% !important; display:flex !important; flex-direction:column !important; }
+    .html-product-card .html-bar{ margin-top:auto !important; }
+    .feature-card{ min-height:215px !important; height:100% !important; }
+    .step-node{ min-height:190px !important; height:100% !important; display:flex !important; flex-direction:column !important; align-items:center !important; }
+    .method-card{ min-height:320px !important; height:100% !important; display:flex !important; flex-direction:column !important; }
+    .method-card .code-note{ margin-top:auto !important; }
+    .method-step{ display:flex !important; flex-direction:column !important; align-items:center !important; height:100% !important; }
+    .tech-card.compact{ min-height:92px !important; height:100% !important; }
+
+    /* Samakan tinggi kolom dalam satu baris (stretch) lalu turunkan ke kartu */
+    [data-testid="stHorizontalBlock"]:has(.html-product-card),
+    [data-testid="stHorizontalBlock"]:has(.method-card),
+    [data-testid="stHorizontalBlock"]:has(.feature-card),
+    [data-testid="stHorizontalBlock"]:has(.step-node),
+    [data-testid="stHorizontalBlock"]:has(.tech-card){
+        align-items:stretch !important;
+    }
+    [data-testid="stHorizontalBlock"]:has(.html-product-card) [data-testid="stColumn"],
+    [data-testid="stHorizontalBlock"]:has(.method-card) [data-testid="stColumn"],
+    [data-testid="stHorizontalBlock"]:has(.feature-card) [data-testid="stColumn"],
+    [data-testid="stHorizontalBlock"]:has(.step-node) [data-testid="stColumn"],
+    [data-testid="stHorizontalBlock"]:has(.tech-card) [data-testid="stColumn"]{
+        display:flex !important;
+        flex-direction:column !important;
+        min-width:0 !important;
+    }
+    [data-testid="stHorizontalBlock"]:has(.html-product-card) [data-testid="stColumn"] > div,
+    [data-testid="stHorizontalBlock"]:has(.method-card) [data-testid="stColumn"] > div,
+    [data-testid="stHorizontalBlock"]:has(.feature-card) [data-testid="stColumn"] > div,
+    [data-testid="stHorizontalBlock"]:has(.step-node) [data-testid="stColumn"] > div,
+    [data-testid="stHorizontalBlock"]:has(.tech-card) [data-testid="stColumn"] > div,
+    [data-testid="stHorizontalBlock"]:has(.html-product-card) [data-testid="stColumn"] [data-testid="stVerticalBlock"],
+    [data-testid="stHorizontalBlock"]:has(.method-card) [data-testid="stColumn"] [data-testid="stVerticalBlock"],
+    [data-testid="stHorizontalBlock"]:has(.feature-card) [data-testid="stColumn"] [data-testid="stVerticalBlock"],
+    [data-testid="stHorizontalBlock"]:has(.step-node) [data-testid="stColumn"] [data-testid="stVerticalBlock"],
+    [data-testid="stHorizontalBlock"]:has(.tech-card) [data-testid="stColumn"] [data-testid="stVerticalBlock"],
+    [data-testid="stHorizontalBlock"]:has(.html-product-card) [data-testid="stColumn"] [data-testid="stElementContainer"],
+    [data-testid="stHorizontalBlock"]:has(.method-card) [data-testid="stColumn"] [data-testid="stElementContainer"],
+    [data-testid="stHorizontalBlock"]:has(.feature-card) [data-testid="stColumn"] [data-testid="stElementContainer"],
+    [data-testid="stHorizontalBlock"]:has(.step-node) [data-testid="stColumn"] [data-testid="stElementContainer"],
+    [data-testid="stHorizontalBlock"]:has(.tech-card) [data-testid="stColumn"] [data-testid="stElementContainer"],
+    [data-testid="stHorizontalBlock"]:has(.html-product-card) [data-testid="stColumn"] [data-testid="stMarkdown"],
+    [data-testid="stHorizontalBlock"]:has(.method-card) [data-testid="stColumn"] [data-testid="stMarkdown"],
+    [data-testid="stHorizontalBlock"]:has(.feature-card) [data-testid="stColumn"] [data-testid="stMarkdown"],
+    [data-testid="stHorizontalBlock"]:has(.step-node) [data-testid="stColumn"] [data-testid="stMarkdown"],
+    [data-testid="stHorizontalBlock"]:has(.tech-card) [data-testid="stColumn"] [data-testid="stMarkdown"],
+    [data-testid="stHorizontalBlock"]:has(.html-product-card) [data-testid="stColumn"] [data-testid="stMarkdownContainer"],
+    [data-testid="stHorizontalBlock"]:has(.method-card) [data-testid="stColumn"] [data-testid="stMarkdownContainer"],
+    [data-testid="stHorizontalBlock"]:has(.feature-card) [data-testid="stColumn"] [data-testid="stMarkdownContainer"],
+    [data-testid="stHorizontalBlock"]:has(.step-node) [data-testid="stColumn"] [data-testid="stMarkdownContainer"],
+    [data-testid="stHorizontalBlock"]:has(.tech-card) [data-testid="stColumn"] [data-testid="stMarkdownContainer"]{
+        height:100% !important;
+        width:100% !important;
+        min-width:0 !important;
+    }
+
+    /* Saat sangat sempit / split-screen: gambar + teks stack, harga turun ke bawah */
+    @media(max-width:760px){
+        .html-product-top{ grid-template-columns:64px minmax(0,1fr) !important; gap:.75rem !important; }
+        .html-price{
+            grid-column:1 / -1 !important;
+            text-align:left !important;
+            display:flex !important;
+            justify-content:space-between !important;
+            align-items:center !important;
+            flex-wrap:wrap !important;
+            gap:.4rem !important;
+            margin-top:.5rem !important;
         }
     }
 
@@ -2154,9 +2300,9 @@ def recommendations_page():
                             <div class="swatch" style="width:34px;height:28px;background:{hex_color};"></div>
                             <span class="small-text">{hex_color}</span>
                         </div>
-                        <div style="margin-top:.65rem;">
-                            <span class="chip">{ehtml(undertone)}</span>
-                            <span class="chip">{ehtml(skintone)}</span>
+                        <div style="margin-top:.65rem;display:flex;align-items:center;gap:.5rem;flex-wrap:nowrap;">
+                            <span class="chip" style="display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;margin:0;">{ehtml(undertone)}</span>
+                            <span class="chip" style="display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;margin:0;">{ehtml(skintone)}</span>
                         </div>
                     </div>
                     <div class="html-price">
@@ -2182,7 +2328,7 @@ def recommendations_page():
 
     render_recommendation_section(
         "💚 Top 3 On Budget",
-        "Lowest price options available in your dataset",
+        "Lowest price options available in your dataset · sorted cheapest first",
         on_budget,
         'style="background:rgba(212,235,194,.7);color:#758952;border-color:rgba(181,196,154,.55);"'
     )
@@ -2228,7 +2374,7 @@ def about_method_page():
             with col:
                 st.markdown(f'<div class="custom-card method-card" style="border-color:{color}66;"><div style="display:flex;align-items:center;gap:.9rem;"><div class="method-icon" style="background:{color}22;color:{color};margin:0;">{icon}</div><div><div class="metric-label" style="color:{color};">{step}</div><div style="font-weight:900;font-size:1.05rem;">{title}</div></div></div><div class="chip" style="margin-top:1rem;background:{color}18;color:{color};border-color:{color}33;">{tag}</div><div class="small-text" style="margin-top:.9rem;">{desc}</div><div class="code-note" style="background:{color}12;border:1px solid {color}55;color:{color};">{note}</div></div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown('<div class="custom-card tech-stack-box"><h3 style="font-family:Inter;margin-top:0;">Technology Stack</h3>', unsafe_allow_html=True)
+    st.markdown('<div class="custom-card tech-stack-box"><h3 style="font-family:Inter; margin-top:0; margin-bottom: 1.5rem;">Technology Stack</h3>', unsafe_allow_html=True)
     techs=[("🐍","Python","Core Language","#66B4E8"),("👑","Streamlit","Frontend Framework","#F48ABD"),("🔶","OpenCV","Computer Vision","#FF9A57"),("🌿","scikit-learn","Machine Learning","#758952"),("🧊","NumPy","Numeric Computing","#A66BCF"),("📊","Pandas","Data Processing","#66B4E8"),("💧","CIELAB ΔE","Color Space & Metric","#FF9A57"),("✣","K-Means","Clustering Algorithm","#758952")]
     for i in range(0,8,4):
         cols=st.columns(4, gap="medium")
