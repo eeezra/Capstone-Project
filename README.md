@@ -10,5 +10,5 @@ File yang dibuat:
 
 ```bash
 cd shademate_streamlit_ui
-streamlit run app_ui_baru.py
+streamlit run app.py
 ```
