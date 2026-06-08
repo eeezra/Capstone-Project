@@ -4,7 +4,7 @@ File yang dibuat:
 - `app.py` — UI Streamlit untuk aplikasi ShadeMate
 - `style.css` — styling
 - `assets/` — logo dan product images
-- `data/foundation_mst.csv` — dataset foundation
+- `foundation_mst.csv` — dataset foundation
 
 ## Cara menjalankan
 
