@@ -255,7 +255,7 @@ def get_skin_features(img_rgb, lms):
         for ci, ch in enumerate(['L', 'a', 'b']):
             feats[f'{zone_name}_{ch}_mean'] = float(px[:, ci].mean())
             feats[f'{zone_name}_{ch}_std']  = float(px[:, ci].std())
-        # FIX Bug 1: Formula ITA yang benar adalah atan2(L - 50, b)
+        # Formula ITA: atan2(L - 50, b)
         # L dikurangi 50 sesuai standar ilmiah ITA dan konsisten dengan predict_mst_hybrid()
         feats[f'{zone_name}_ITA'] = math.degrees(
             math.atan2(px[:, 0].mean() - 50, px[:, 2].mean())
